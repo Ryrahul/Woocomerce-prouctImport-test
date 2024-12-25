@@ -26,9 +26,9 @@ export class ProductPopulator {
     async populate() {
         const ctx = await this.getSuperadminContext(this.app);
         const api = new WooCommerceRestApi({
-            url: process.env.API_URL,
-            consumerKey: process.env.CONSUMER_KEY,
-            consumerSecret: process.env.CONSUMER_SECRET,
+            url: process.env.API_URL!,
+            consumerKey: process.env.CONSUMER_KEY!,
+            consumerSecret: process.env.CONSUMER_SECRET!,
             version: 'wc/v3',
         });
 
