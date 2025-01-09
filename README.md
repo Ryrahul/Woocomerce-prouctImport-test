@@ -13,8 +13,8 @@ This repository contains a Vendure-based e-commerce application and a WooCommerc
 
 1. Clone the repository:
    ```bash
-   git clone <repository-url>
-   cd <repository-folder>
+   git clone https://github.com/Ryrahul/Woocomerce-prouctImport-test.git
+  
 
 2. Install Dependencies
    ```bash
