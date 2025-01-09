@@ -34,14 +34,12 @@ async function run() {
             ...config,
         });
 
-        // Get required services
         const assetService = app.get(AssetService);
         const connection = app.get(TransactionalConnection);
         const configService = app.get(ConfigService);
         const fastImporterService = app.get(FastImporterService);
         const searchService = app.get(SearchService);
 
-        // Initialize populator with all required services
         const populator = new ProductPopulator(
             app,
             assetService,
@@ -51,7 +49,6 @@ async function run() {
             searchService,
         );
 
-        // Run population
         const result = await populator.populate();
 
         const end = performance.now();
