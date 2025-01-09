@@ -1,34 +1,45 @@
-import { INestApplicationContext } from '@nestjs/common';
+import { Injectable, INestApplicationContext } from '@nestjs/common';
 import {
+    AssetService,
     ConfigService,
+    FastImporterService,
     ID,
     LanguageCode,
+    Logger,
+    Product,
     ProductService,
     ProductVariantService,
     RequestContext,
     RequestContextService,
+    SearchService,
+    StockLocation,
+    TaxCategory,
     TransactionalConnection,
     User,
+    isGraphQlErrorResult,
+    Asset,
 } from '@vendure/core';
 import WooCommerceRestApi from '@woocommerce/woocommerce-rest-api';
+import { Readable } from 'stream';
+import { IsNull } from 'typeorm';
 
+@Injectable()
 export class ProductPopulator {
-    private productService: ProductService;
-    private productVariantService: ProductVariantService;
-    private app: INestApplicationContext;
-
-    constructor(app: INestApplicationContext) {
-        this.productService = app.get(ProductService);
-        this.productVariantService = app.get(ProductVariantService);
-        this.app = app;
-    }
+    constructor(
+        private app: INestApplicationContext,
+        private assetService: AssetService,
+        private connection: TransactionalConnection,
+        private configService: ConfigService,
+        private fastImporterService: FastImporterService,
+        private searchService: SearchService,
+    ) {}
 
     async populate() {
-        const ctx = await this.getSuperadminContext(this.app);
+        const ctx = await this.getSuperadminContext();
         const api = new WooCommerceRestApi({
-            url: process.env.API_URL!,
-            consumerKey: process.env.CONSUMER_KEY!,
-            consumerSecret: process.env.CONSUMER_SECRET!,
+            url: 'https://naulokoseli.com',
+            consumerKey: 'ck_57aa7580dc689050975eb07196ddfff6abb57ae8',
+            consumerSecret: 'cs_65c2008af775be426eb89e140d4b83787e2c2a2f',
             version: 'wc/v3',
         });
 
@@ -37,31 +48,52 @@ export class ProductPopulator {
             let allProducts: any[] = [];
             let products;
 
+            // Fetch all products from WooCommerce
             do {
-                console.time(page.toString());
+                console.time(`Page ${page}`);
                 products = await api.get('products', {
                     per_page: 100,
                     page: page,
                 });
                 allProducts = [...allProducts, ...products.data];
-                console.timeEnd(page.toString());
+                console.timeEnd(`Page ${page}`);
                 page++;
             } while (products.data.length > 0);
 
             console.log(`Total products fetched: ${allProducts.length}`);
-            const batches = this.createBatches(allProducts, 10);
-            for (const batch of batches) {
-                await this.processBatch(ctx, batch);
+
+            // Get necessary entities
+            const stockLocation = await this.getStockLocation(ctx);
+            const defaultTaxCategory = await this.getDefaultTaxCategory(ctx);
+            console.log(stockLocation);
+            console.log(defaultTaxCategory);
+
+            if (!stockLocation || !defaultTaxCategory) {
+                throw new Error('Required entities not found');
             }
+
+            // Process products in batches
+            const batches = this.createBatches(allProducts, 10);
+            let successCount = 0;
+            let errorCount = 0;
+
+            for (const batch of batches) {
+                const results = await this.processBatch(ctx, batch, stockLocation, defaultTaxCategory);
+                successCount += results.successCount;
+                errorCount += results.errorCount;
+            }
+
+            // Reindex search after import
+            await this.searchService.reindex(ctx);
+
+            return { successCount, errorCount };
         } catch (error: any) {
-            console.error(
-                'Error fetching or processing WooCommerce data:',
-                error.response?.data || error.message,
-            );
+            console.error('Error in product population:', error.response?.data || error.message);
+            throw error;
         }
     }
 
-    createBatches<T>(data: T[], batchSize: number): T[][] {
+    private createBatches<T>(data: T[], batchSize: number): T[][] {
         const batches: T[][] = [];
         for (let i = 0; i < data.length; i += batchSize) {
             batches.push(data.slice(i, i + batchSize));
@@ -69,148 +101,280 @@ export class ProductPopulator {
         return batches;
     }
 
-    async processBatch(ctx: RequestContext, batch: any[]) {
-        for (const product of batch) {
-            console.log(`Processing product: ${product.name}`);
-            try {
-                const productResult = await this.createOrUpdateProduct(ctx, product);
+    private async processBatch(
+        ctx: RequestContext,
+        products: any[],
+        stockLocation: StockLocation,
+        taxCategory: TaxCategory,
+    ) {
+        let successCount = 0;
+        let errorCount = 0;
+        let variableId: ID | undefined;
 
-                if (product.variations && product.variations.length > 0) {
-                    console.log(`Creating variants for product: ${product.name}`);
-                    await this.createVariants(ctx, productResult.id, product);
-                } else {
-                    console.log(`Creating default variant for product: ${product.name}`);
-                    await this.createDefaultVariant(ctx, productResult.id, product);
+        for (const product of products) {
+            try {
+                // Check if product already exists
+                const existingProduct = await this.connection.getRepository(ctx, Product).findOne({
+                    where: {
+                        deletedAt: IsNull(),
+                        customFields: {
+                            woocommerceId: product.id,
+                        },
+                    },
+                });
+
+                if (existingProduct) {
+                    console.log(`Product already exists. WooCommerce ID: ${product.id}`);
+                    successCount++;
+                    continue;
                 }
+
+                // Process images
+                const assets = await this.processImages(ctx, product.images);
+
+                // Initialize fast importer
+                await this.fastImporterService.initialize(ctx.channel);
+
+                if (product.type === 'simple') {
+                    await this.processSimpleProduct(ctx, product, assets, stockLocation, taxCategory);
+                    variableId = undefined;
+                } else if (product.type === 'variable') {
+                    variableId = await this.processVariableProduct(ctx, product, assets);
+                } else if (product.type === 'variation' && variableId) {
+                    await this.processVariation(ctx, product, assets, variableId, stockLocation, taxCategory);
+                }
+
+                successCount++;
             } catch (error: any) {
-                console.error(`Error processing product ${product.name}:`, error.message);
+                Logger.error(`Error processing product ${product.name}: ${error.message}`);
+                errorCount++;
             }
         }
+
+        return { successCount, errorCount };
     }
 
-    async createOrUpdateProduct(ctx: RequestContext, product: any) {
-        const createdProduct = await this.productService.create(ctx, {
+    private async processSimpleProduct(
+        ctx: RequestContext,
+        product: any,
+        assets: Asset[],
+        stockLocation: StockLocation,
+        taxCategory: TaxCategory,
+    ) {
+        const { productId } = await this.createProduct(ctx, {
+            name: product.name,
+            slug: product.slug,
+            description: product.description,
+            wooCommerceId: product.id,
+            assets,
+        });
+
+        await this.createVariant(ctx, {
+            productId,
+            name: product.name,
+            description: product.description,
+            stock: product.stock_quantity || 0,
+            price: Math.round(parseFloat(product.price) * 100),
+            weight: product.weight || 0,
+            stockLocationId: stockLocation.id,
+            taxCategoryId: taxCategory.id,
+            assets,
+        });
+    }
+
+    private async processVariableProduct(ctx: RequestContext, product: any, assets: Asset[]): Promise<ID> {
+        const { productId } = await this.createProduct(ctx, {
+            name: product.name,
+            slug: product.slug,
+            description: product.description,
+            wooCommerceId: product.id,
+            assets,
+        });
+        return productId;
+    }
+
+    private async processVariation(
+        ctx: RequestContext,
+        product: any,
+        assets: Asset[],
+        variableId: ID,
+        stockLocation: StockLocation,
+        taxCategory: TaxCategory,
+    ) {
+        await this.createVariant(ctx, {
+            productId: variableId,
+            name: product.name,
+            description: product.description,
+            stock: product.stock_quantity || 0,
+            price: Math.round(parseFloat(product.price) * 100),
+            weight: product.weight || 0,
+            stockLocationId: stockLocation.id,
+            taxCategoryId: taxCategory.id,
+            assets,
+        });
+    }
+
+    private async createProduct(
+        ctx: RequestContext,
+        input: {
+            name: string;
+            slug: string;
+            description: string;
+            wooCommerceId: string;
+            assets: Asset[];
+        },
+    ) {
+        const productId = await this.fastImporterService.createProduct({
+            enabled: true,
+            assetIds: input.assets.map(asset => asset.id),
+            featuredAssetId: input.assets[0]?.id,
             translations: [
                 {
                     languageCode: LanguageCode.en,
-                    name: product.name,
-                    description: product.description || '',
-                    slug: product.slug,
+                    name: input.name,
+                    slug: input.slug,
+                    description: input.description,
+                },
+            ],
+            customFields: {
+                woocommerceId: input.wooCommerceId,
+            },
+        });
+
+        return { productId };
+    }
+
+    private async createVariant(
+        ctx: RequestContext,
+        input: {
+            productId: ID;
+            name: string;
+            description: string;
+            stock: number;
+            price: number;
+            weight: number;
+            stockLocationId: ID;
+            taxCategoryId: ID;
+            assets: Asset[];
+        },
+    ) {
+        return this.fastImporterService.createProductVariant({
+            productId: input.productId,
+            sku: `${input.name}-${Date.now()}`,
+            stockOnHand: input.stock,
+            price: input.price,
+            taxCategoryId: input.taxCategoryId,
+            assetIds: input.assets.map(asset => asset.id),
+            featuredAssetId: input.assets[0]?.id,
+            stockLevels: [
+                {
+                    stockOnHand: input.stock,
+                    stockLocationId: input.stockLocationId,
+                },
+            ],
+            customFields: {
+                weight: input.weight,
+            },
+            translations: [
+                {
+                    languageCode: LanguageCode.en,
+                    name: input.name,
                 },
             ],
         });
-
-        return createdProduct;
     }
 
-    async createVariants(ctx: RequestContext, productId: ID, product: any) {
-        const existingVariants = await this.productVariantService.findAll(ctx, {
-            filter: {
-                productId: { eq: String(productId) },
+    private async processImages(ctx: RequestContext, images: any[]): Promise<Asset[]> {
+        const assets: Asset[] = [];
+        for (const image of images) {
+            try {
+                const asset = await this.uploadImage(ctx, image.src);
+                if (asset) {
+                    const assetWithChannels = await this.connection.getRepository(ctx, Asset).findOne({
+                        where: { id: asset.id },
+                        relations: ['channels'],
+                    });
+                    if (assetWithChannels) {
+                        assets.push(assetWithChannels);
+                    }
+                }
+            } catch (error) {
+                Logger.error(`Failed to process image: ${error}`);
+            }
+        }
+        return assets;
+    }
+
+    private async uploadImage(ctx: RequestContext, url?: string): Promise<Asset | null> {
+        try {
+            if (!url) return null;
+
+            const res = await fetch(url);
+            if (!res.ok) {
+                Logger.warn('Failed to fetch image');
+                return null;
+            }
+
+            const reader = res.body!.getReader();
+            const chunks: Uint8Array[] = [];
+            let done = false;
+
+            while (!done) {
+                const { value, done: doneReading } = await reader.read();
+                done = doneReading;
+                if (value) {
+                    chunks.push(value);
+                }
+            }
+
+            const buffer = Buffer.concat(chunks);
+            const readable = new Readable();
+            readable.push(buffer);
+            readable.push(null);
+
+            const asset = await this.assetService.createFromFileStream(readable, `${Date.now()}.jpeg`, ctx);
+
+            if (isGraphQlErrorResult(asset)) {
+                return null;
+            }
+
+            return this.connection.getRepository(ctx, Asset).findOne({
+                where: { id: asset.id },
+                relations: ['channels'],
+            });
+        } catch (error) {
+            Logger.error(`Error uploading image: ${error}`);
+            return null;
+        }
+    }
+
+    private async getStockLocation(ctx: RequestContext): Promise<StockLocation | null> {
+        return this.connection.getRepository(ctx, StockLocation).findOne({
+            where: {
+                channels: {
+                    id: ctx.channelId,
+                },
+            },
+        });
+    }
+
+    private async getDefaultTaxCategory(ctx: RequestContext): Promise<TaxCategory | null> {
+        return this.connection.getRepository(ctx, TaxCategory).findOne({
+            where: {
+                isDefault: true,
+            },
+        });
+    }
+
+    private async getSuperadminContext(): Promise<RequestContext> {
+        const { superadminCredentials } = this.configService.authOptions;
+        const superAdminUser = await this.connection.getRepository(User).findOneOrFail({
+            where: {
+                identifier: superadminCredentials.identifier,
             },
         });
 
-        const variants = existingVariants.items;
-        const productPrice = parseFloat(product.price) * 100;
-
-        if (isNaN(productPrice) || productPrice <= 0) {
-            console.warn(
-                `Invalid price for product ${product.name}. Setting price to 0. Price received:`,
-                product.price,
-            );
-        }
-
-        for (const variation of product.variations) {
-            try {
-                let variantAttributes = product.attributes
-                    ? product.attributes.map((attr: any) => ({
-                          name: attr.name,
-                          value:
-                              variation.attributes && variation.attributes[attr.name]
-                                  ? variation.attributes[attr.name]
-                                  : 'default',
-                      }))
-                    : [];
-
-                let sku = variation.sku || `${product.sku}-${Date.now()}`;
-
-                const combinationExists = variants.some((variant: any) => {
-                    return variant.attributes.every((attribute: any) => {
-                        return variantAttributes.some(
-                            (va: any) => va.name === attribute.name && va.value === attribute.value,
-                        );
-                    });
-                });
-
-                if (combinationExists) {
-                    console.log(
-                        `Combination already exists for ${product.name}, generating a new unique variant...`,
-                    );
-
-                    variantAttributes = variantAttributes.map((attr: any) => ({
-                        ...attr,
-                        value: `${attr.value}-${Date.now()}`,
-                    }));
-
-                    sku = `${sku}-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
-                }
-
-                const price = productPrice;
-
-                const createdVariant = await this.productVariantService.create(ctx, [
-                    {
-                        productId,
-                        sku,
-                        price: price,
-                        stockOnHand: variation.stock_quantity || 0,
-                        translations: [
-                            {
-                                languageCode: LanguageCode.en,
-                                name: `${product.name} - ${variantAttributes.map((a: any) => a.value).join(', ')}`,
-                            },
-                        ],
-                    },
-                ]);
-
-                console.log(`Variant created: ${createdVariant[0].id}`);
-            } catch (error: any) {
-                console.error(`Error creating variant for product ${product.name}:`, error.message);
-            }
-        }
-    }
-
-    async createDefaultVariant(ctx: RequestContext, productId: ID, product: any) {
-        const productPrice = parseFloat(product.price) * 100;
-
-        const defaultSku = product.sku || `${product.name}-${Date.now()}`;
-
-        const createdVariant = await this.productVariantService.create(ctx, [
-            {
-                productId,
-                sku: defaultSku,
-                price: productPrice,
-                stockOnHand: product.stock_quantity || 0,
-                translations: [
-                    {
-                        languageCode: LanguageCode.en,
-                        name: `${product.name} - Default Variant`,
-                    },
-                ],
-            },
-        ]);
-
-        console.log(
-            `Default variant created for product: ${product.name}, Variant ID: ${createdVariant[0].id}`,
-        );
-    }
-
-    async getSuperadminContext(app: INestApplicationContext): Promise<RequestContext> {
-        const { superadminCredentials } = app.get(ConfigService).authOptions;
-        const superAdminUser = await app
-            .get(TransactionalConnection)
-            .getRepository(User)
-            .findOneOrFail({ where: { identifier: superadminCredentials.identifier } });
-        return app.get(RequestContextService).create({
+        return this.app.get(RequestContextService).create({
             apiType: 'admin',
             user: superAdminUser,
         });
