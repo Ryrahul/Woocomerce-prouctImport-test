@@ -48,7 +48,6 @@ export class ProductPopulator {
             let allProducts: any[] = [];
             let products;
 
-            // Fetch all products from WooCommerce
             do {
                 console.time(`Page ${page}`);
                 products = await api.get('products', {
@@ -62,7 +61,6 @@ export class ProductPopulator {
 
             console.log(`Total products fetched: ${allProducts.length}`);
 
-            // Get necessary entities
             const stockLocation = await this.getStockLocation(ctx);
             const defaultTaxCategory = await this.getDefaultTaxCategory(ctx);
             console.log(stockLocation);
@@ -72,7 +70,6 @@ export class ProductPopulator {
                 throw new Error('Required entities not found');
             }
 
-            // Process products in batches
             const batches = this.createBatches(allProducts, 10);
             let successCount = 0;
             let errorCount = 0;
@@ -83,7 +80,6 @@ export class ProductPopulator {
                 errorCount += results.errorCount;
             }
 
-            // Reindex search after import
             await this.searchService.reindex(ctx);
 
             return { successCount, errorCount };
@@ -113,7 +109,6 @@ export class ProductPopulator {
 
         for (const product of products) {
             try {
-                // Check if product already exists
                 const existingProduct = await this.connection.getRepository(ctx, Product).findOne({
                     where: {
                         deletedAt: IsNull(),
@@ -129,10 +124,8 @@ export class ProductPopulator {
                     continue;
                 }
 
-                // Process images
                 const assets = await this.processImages(ctx, product.images);
 
-                // Initialize fast importer
                 await this.fastImporterService.initialize(ctx.channel);
 
                 if (product.type === 'simple') {
