@@ -3,9 +3,10 @@ import {
     DefaultJobQueuePlugin,
     DefaultSearchPlugin,
     VendureConfig,
+    DefaultAssetNamingStrategy,
 } from '@vendure/core';
 import { defaultEmailHandlers, EmailPlugin } from '@vendure/email-plugin';
-import { AssetServerPlugin } from '@vendure/asset-server-plugin';
+import { AssetServerPlugin, configureS3AssetStorage } from '@vendure/asset-server-plugin';
 import { AdminUiPlugin } from '@vendure/admin-ui-plugin';
 import 'dotenv/config';
 import { customAdminUi } from './custom-admin-ui/compile-admin-ui';
@@ -39,8 +40,8 @@ export const config: VendureConfig = {
     authOptions: {
         tokenMethod: ['bearer', 'cookie'],
         superadminCredentials: {
-            identifier: String(process.env.SUPERADMIN_USERNAME),
-            password: String(process.env.SUPERADMIN_PASSWORD),
+            identifier: 'superadmin',
+            password: 'superadmin',
         },
         cookieOptions: {
             secret: process.env.COOKIE_SECRET,
@@ -48,8 +49,6 @@ export const config: VendureConfig = {
     },
     dbConnectionOptions: {
         type: 'postgres',
-        // See the README.md "Migrations" section for an explanation of
-        // the `synchronize` and `migrations` options.
         synchronize: true,
         migrations: [path.join(__dirname, './migrations/*.+(js|ts)')],
         logging: false,
@@ -65,16 +64,37 @@ export const config: VendureConfig = {
     },
     // When adding or altering custom field definitions, the database will
     // need to be updated. See the "Migrations" section in README.md.
-    customFields: {},
+    customFields: {
+        Product: [
+            {
+                name: 'woocommerceId',
+                type: 'string',
+            },
+        ],
+    },
     plugins: [
         AssetServerPlugin.init({
             route: 'assets',
             assetUploadDir: path.join(__dirname, '../static/assets'),
-            // For local dev, the correct value for assetUrlPrefix should
-            // be guessed correctly, but for production it will usually need
-            // to be set manually to match your production url.
-            assetUrlPrefix: IS_DEV ? undefined : 'https://www.my-shop.com/assets',
+            namingStrategy: new DefaultAssetNamingStrategy(),
+
+            // storageStrategyFactory: !IS_DEV
+            //     ? configureS3AssetStorage({
+            //           bucket: String(process.env.AWS_BUCKET),
+            //           credentials: {
+            //               accessKeyId: String(process.env.AWS_ACCESS_KEY_ID),
+            //               secretAccessKey: String(process.env.AWS_SECRET_ACCESS_KEY),
+            //           },
+            //           nativeS3Configuration: {
+            //               endpoint: String(process.env.AWS_ENDPOINT),
+            //               s3ForcePathStyle: true,
+            //               region: String(process.env.AWS_REGION),
+            //           },
+            //       })
+            //     : undefined,
+            assetUrlPrefix: !IS_DEV ? `http://localhost:3000/assets/` : undefined,
         }),
+
         DefaultJobQueuePlugin.init({ useDatabaseForBuffer: true }),
         DefaultSearchPlugin.init({ bufferUpdates: false, indexStockStatus: true }),
         EmailPlugin.init({

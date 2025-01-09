@@ -18,6 +18,8 @@
         "format": "prettier --write --ignore-unknown"
     },
     "dependencies": {
+        "@aws-sdk/client-s3": "^3.723.0",
+        "@aws-sdk/lib-storage": "^3.723.0",
         "@vendure/admin-ui-plugin": "^3.0.5",
         "@vendure/asset-server-plugin": "^3.0.5",
         "@vendure/core": "^3.0.5",
