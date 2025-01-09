@@ -37,9 +37,9 @@ export class ProductPopulator {
     async populate() {
         const ctx = await this.getSuperadminContext();
         const api = new WooCommerceRestApi({
-            url: 'https://naulokoseli.com',
-            consumerKey: 'ck_57aa7580dc689050975eb07196ddfff6abb57ae8',
-            consumerSecret: 'cs_65c2008af775be426eb89e140d4b83787e2c2a2f',
+            url: process.env.URL!,
+            consumerKey: process.env.CONSUMER_KEY!,
+            consumerSecret: process.env.CONSUMER_SECRET!,
             version: 'wc/v3',
         });
 
